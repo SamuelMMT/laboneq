@@ -17,6 +17,7 @@ from laboneq.controller.devices.zi_node_monitor import (
     Condition,
     NodeControlBase,
     Response,
+    WaitCondition,
 )
 from laboneq.controller.recipe_processor import DeviceRecipeData, RecipeData
 from laboneq.controller.versioning import SUPPORT_PRE_V23_06, LabOneVersion
@@ -63,6 +64,28 @@ class DevicePQSC(DeviceZI):
             Response(f"/{self.serial}/system/clocks/referenceclock/in/status", 0),
         ]
 
+    def zsync_link_control_nodes(self) -> list[NodeControlBase]:
+        nodes = []
+        enabled_zsyncs = {}
+        for port, down_stream_devices in self._downlinks.items():
+            # No command, these nodes will respond to the follower device switching to ZSync
+            nodes.append(
+                WaitCondition(f"/{self.serial}/{port.lower()}/connection/status", 2),
+            )
+            for _, dev_ref in down_stream_devices:
+                dev = dev_ref()
+                if enabled_zsyncs.get(port.lower()) == dev.serial:
+                    # Avoid double-enabling the port when it is connected to SHFQC
+                    continue
+                enabled_zsyncs[port.lower()] = dev.serial
+                nodes.append(
+                    WaitCondition(
+                        f"/{self.serial}/{port.lower()}/connection/serial",
+                        dev.serial[3:],
+                    ),
+                )
+        return nodes
+
     def collect_initialization_nodes(
         self, device_recipe_data: DeviceRecipeData, initialization: Initialization
     ) -> list[DaqNodeAction]:
@@ -77,51 +100,59 @@ class DevicePQSC(DeviceZI):
                 self.daq, f"/{self.serial}/execution/holdoff", min_wait_time
             )
         ]
-        for port, (follower_uid, follower_ref) in self._downlinks.items():
+        enabled_zsyncs = set()
+        for port, downstream_devices in self._downlinks.items():
             [p_kind, p_addr] = port.split("/")
-            follower = follower_ref()
-            if p_kind != "ZSYNCS" or follower is None:
+            if p_kind != "ZSYNCS":
                 continue
-            for awg_key, awg_config in recipe_data.awg_configs.items():
-                if (
-                    awg_key.device_uid != follower_uid
-                    or awg_config.source_feedback_register is None
-                ):
-                    continue  # Only consider devices receiving feedback from PQSC
+            zsync_output = f"/{self.serial}/zsyncs/{p_addr}/output"
+            zsync_base = f"{zsync_output}/registerbank"
+            for follower_uid, follower_ref in downstream_devices:
+                follower = follower_ref()
+                if follower is None:
+                    continue
+                for awg_key, awg_config in recipe_data.awg_configs.items():
+                    if (
+                        awg_key.device_uid != follower_uid
+                        or awg_config.source_feedback_register is None
+                    ):
+                        continue
+                    if p_addr in enabled_zsyncs:
+                        actions_to_enable_feedback = []
+                    elif SUPPORT_PRE_V23_06 and (
+                        self.daq._dataserver_version < LabOneVersion.V_23_06
+                    ):
+                        actions_to_enable_feedback = [
+                            DaqNodeSetAction(self.daq, f"{zsync_base}/enable", 1)
+                        ]
+                    else:
+                        actions_to_enable_feedback = [
+                            DaqNodeSetAction(self.daq, f"{zsync_output}/enable", 1),
+                            DaqNodeSetAction(self.daq, f"{zsync_output}/source", 0),
+                        ]
+                    enabled_zsyncs.add(p_addr)
+                    feedback_actions.extend(actions_to_enable_feedback)
 
-                zsync_output = f"/{self.serial}/zsyncs/{p_addr}/output"
-                zsync_base = f"{zsync_output}/registerbank"
-                if SUPPORT_PRE_V23_06 and (
-                    self.daq._dataserver_version < LabOneVersion.V_23_06
-                ):
-                    actions_to_enable_feedback = [
-                        DaqNodeSetAction(self.daq, f"{zsync_base}/enable", 1)
-                    ]
-                else:
-                    actions_to_enable_feedback = [
-                        DaqNodeSetAction(self.daq, f"{zsync_output}/enable", 1),
-                        DaqNodeSetAction(self.daq, f"{zsync_output}/source", 0),
-                    ]
-
-                feedback_actions.extend(actions_to_enable_feedback)
-                reg_selector_base = (
-                    f"{zsync_base}/sources/{awg_config.register_selector_index}"
-                )
-                feedback_actions.extend(
-                    [
-                        DaqNodeSetAction(self.daq, f"{reg_selector_base}/enable", 1),
-                        DaqNodeSetAction(
-                            self.daq,
-                            f"{reg_selector_base}/register",
-                            awg_config.source_feedback_register,
-                        ),
-                        DaqNodeSetAction(
-                            self.daq,
-                            f"{reg_selector_base}/index",
-                            awg_config.readout_result_index,
-                        ),
-                    ]
-                )
+                    reg_selector_base = (
+                        f"{zsync_base}/sources/{awg_config.register_selector_index}"
+                    )
+                    feedback_actions.extend(
+                        [
+                            DaqNodeSetAction(
+                                self.daq, f"{reg_selector_base}/enable", 1
+                            ),
+                            DaqNodeSetAction(
+                                self.daq,
+                                f"{reg_selector_base}/register",
+                                awg_config.source_feedback_register,
+                            ),
+                            DaqNodeSetAction(
+                                self.daq,
+                                f"{reg_selector_base}/index",
+                                awg_config.readout_result_index,
+                            ),
+                        ]
+                    )
         return feedback_actions
 
     def collect_execution_nodes(self, with_pipeliner: bool):
@@ -173,7 +204,7 @@ class DevicePQSC(DeviceZI):
             )
         return nodes
 
-    def collect_trigger_configuration_nodes(
+    async def collect_trigger_configuration_nodes(
         self, initialization: Initialization, recipe_data: RecipeData
     ) -> list[DaqNodeAction]:
         # TODO(2K): This was moved as is from no more existing "configure_as_leader".
@@ -185,7 +216,7 @@ class DevicePQSC(DeviceZI):
             initialization.config.reference_clock,
         )
 
-        self._daq.batch_set(
+        await self._daq.batch_set(
             [
                 DaqNodeSetAction(
                     self._daq,
@@ -195,7 +226,7 @@ class DevicePQSC(DeviceZI):
             ]
         )
 
-        self._daq.batch_set(
+        await self._daq.batch_set(
             [
                 DaqNodeSetAction(
                     self._daq,
@@ -204,15 +235,6 @@ class DevicePQSC(DeviceZI):
                 )
             ]
         )
-
-        # Ensure ZSync links are established
-        # TODO(2K): This is rather a hotfix, waiting to be done in parallel for all devices with
-        # subscription / poll
-        # TODO(2K): Verify also the downlink device serial (.../connection/serial) matches
-        for port in self._downlinks:
-            self._wait_for_node(
-                f"/{self.serial}/{port.lower()}/connection/status", 2, timeout=10
-            )
 
         nodes_to_configure_triggers = []
 

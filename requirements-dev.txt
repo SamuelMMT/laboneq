@@ -5,6 +5,7 @@
 # For tests
 pytest
 pytest-assume
+pytest-asyncio
 pytest-cov
 pytest_mock
 pytest-httpserver
@@ -46,3 +47,6 @@ click==8.0.4
 toml
 build
 python-gitlab
+
+# Package optional dependencies
+-r requirements-optional.txt

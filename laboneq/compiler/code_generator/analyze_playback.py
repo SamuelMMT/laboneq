@@ -13,6 +13,9 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from intervaltree import Interval, IntervalTree
 
+from laboneq.compiler.code_generator.analyze_amplitude_registers import (
+    analyze_amplitude_register_set_events,
+)
 from laboneq.compiler.code_generator.interval_calculator import (
     MinimumWaveformLengthViolation,
     MutableInterval,
@@ -23,6 +26,7 @@ from laboneq.compiler.code_generator.signatures import (
     PulseSignature,
     WaveformSignature,
     reduce_signature_amplitude,
+    reduce_signature_amplitude_register,
     reduce_signature_phase,
 )
 from laboneq.compiler.code_generator.utils import normalize_phase
@@ -33,6 +37,7 @@ from laboneq.compiler.common.awg_sampled_event import (
 )
 from laboneq.compiler.common.awg_signal_type import AWGSignalType
 from laboneq.compiler.common.device_type import DeviceType
+from laboneq.compiler.common.event_type import EventType
 from laboneq.compiler.common.play_wave_type import PlayWaveType
 from laboneq.compiler.common.signal_obj import SignalObj
 from laboneq.core.exceptions import LabOneQException
@@ -53,15 +58,16 @@ class _IntervalStartEvent:
     play_wave_id: str | None
     amplitude: float
     index: int
-    oscillator_phase: Optional[float]
-    oscillator_frequency: Optional[float]
-    phase: Optional[float]
-    sub_channel: Optional[int]
-    baseband_phase: Optional[float]
-    play_pulse_parameters: Optional[Dict[str, Any]]
-    pulse_pulse_parameters: Optional[Dict[str, Any]]
-    state: Optional[int]
-    markers: Optional[Any]
+    oscillator_phase: float | None
+    oscillator_frequency: float | None
+    phase: float | None
+    sub_channel: int | None
+    baseband_phase: float | None
+    play_pulse_parameters: dict[str, Any] | None
+    pulse_pulse_parameters: dict[str, Any] | None
+    state: int | None
+    markers: Any | None
+    amp_param: str | None
 
 
 @dataclass
@@ -84,11 +90,12 @@ class _PlayIntervalData:
     baseband_phase: float
     phase: float
     sub_channel: int
-    play_pulse_parameters: Optional[Dict[str, Any]]
-    pulse_pulse_parameters: Optional[Dict[str, Any]]
+    play_pulse_parameters: dict[str, Any] | None
+    pulse_pulse_parameters: dict[str, Any] | None
     state: int
     start_rounding_error: float
     markers: Any
+    amp_param: str | None
 
 
 def _analyze_branches(events, delay, sampling_rate, playwave_max_hint):
@@ -134,98 +141,101 @@ def _analyze_branches(events, delay, sampling_rate, playwave_max_hint):
     return branching_intervals, states, cut_points
 
 
+def find_event_pairs(events, start_types, end_types):
+    start_events = {}
+    end_events = {}
+    for event in events:
+        if event["event_type"] in start_types:
+            start_events[event["chain_element_id"]] = event
+        elif event["event_type"] in end_types:
+            end_events[event["chain_element_id"]] = event
+
+    return [(start_events[id], end) for id, end in end_events.items()]
+
+
 def _interval_list(events, states, signal_ids, delay, sub_channel):
-    """Compute a flat list of (start, stop) intervals for tall the playback events"""
+    """Compute a flat list of (start, stop) intervals for all the playback events"""
 
     interval_zip: List[Tuple[_IntervalStartEvent, _IntervalEndEvent]] = []
-    for state in itertools.chain(set(states.values()), (None,)):
-        for index, cur_signal_id in enumerate(signal_ids):
-            interval_zip.extend(
-                zip(
-                    [
-                        _IntervalStartEvent(
-                            event_type=event["event_type"],
-                            signal_id=cur_signal_id,
-                            time=event["time"] + delay,
-                            play_wave_id=event["play_wave_id"],
-                            amplitude=event["amplitude"],
-                            index=index,
-                            oscillator_phase=event.get("oscillator_phase"),
-                            oscillator_frequency=event.get("oscillator_frequency"),
-                            phase=event.get("phase"),
-                            sub_channel=sub_channel,
-                            baseband_phase=event.get("baseband_phase"),
-                            play_pulse_parameters=event.get("play_pulse_parameters"),
-                            pulse_pulse_parameters=event.get("pulse_pulse_parameters"),
-                            state=states.get(event["section_name"], None),
-                            markers=event.get("markers"),
-                        )
-                        for event in events
-                        if event["event_type"] in ["PLAY_START"]
-                        and event["signal"] == cur_signal_id
-                        and states.get(event["section_name"], None) == state
-                    ],
-                    [
-                        _IntervalEndEvent(
-                            event_type=event["event_type"],
-                            time=event["time"] + delay,
-                            play_wave_id=event["play_wave_id"],
-                            index=index,
-                        )
-                        for event in events
-                        if event["event_type"] in ["PLAY_END"]
-                        and event["signal"] == cur_signal_id
-                        and states.get(event["section_name"], None) == state
-                    ],
-                )
+
+    play_event_pairs = find_event_pairs(
+        events, [EventType.PLAY_START], [EventType.PLAY_END]
+    )
+    delay_event_pairs = find_event_pairs(
+        events, [EventType.DELAY_START], [EventType.DELAY_END]
+    )
+
+    interval_zip.extend(
+        (
+            (
+                _IntervalStartEvent(
+                    event_type=start["event_type"],
+                    signal_id=cur_signal_id,
+                    time=start["time"] + delay,
+                    play_wave_id=start["play_wave_id"],
+                    amplitude=start["amplitude"],
+                    index=index,
+                    oscillator_phase=start.get("oscillator_phase"),
+                    oscillator_frequency=start.get("oscillator_frequency"),
+                    phase=start.get("phase"),
+                    sub_channel=sub_channel,
+                    baseband_phase=start.get("baseband_phase"),
+                    play_pulse_parameters=start.get("play_pulse_parameters"),
+                    pulse_pulse_parameters=start.get("pulse_pulse_parameters"),
+                    state=states.get(start["section_name"], None),
+                    markers=start.get("markers"),
+                    amp_param=start.get("amplitude_parameter"),
+                ),
+                _IntervalEndEvent(
+                    event_type=end["event_type"],
+                    time=end["time"] + delay,
+                    play_wave_id=end["play_wave_id"],
+                    index=index,
+                ),
             )
-            interval_zip.extend(
-                zip(
-                    [
-                        _IntervalStartEvent(
-                            event_type="DELAY_START",
-                            signal_id=cur_signal_id,
-                            time=event["time"] + delay,
-                            play_wave_id=None,
-                            amplitude=None,
-                            index=index,
-                            oscillator_phase=None,
-                            oscillator_frequency=None,
-                            phase=None,
-                            sub_channel=sub_channel,
-                            baseband_phase=None,
-                            play_pulse_parameters=None,
-                            pulse_pulse_parameters=None,
-                            state=states.get(event["section_name"], None),
-                            markers=None,
-                        )
-                        for event in events
-                        if (
-                            event["event_type"] == "DELAY_START"
-                            and event.get("play_wave_type")
-                            == PlayWaveType.EMPTY_CASE.name
-                        )
-                        and event["signal"] == cur_signal_id
-                        and states.get(event["section_name"], None) == state
-                    ],
-                    [
-                        _IntervalEndEvent(
-                            event_type="DELAY_END",
-                            time=event["time"] + delay,
-                            play_wave_id=None,
-                            index=index,
-                        )
-                        for event in events
-                        if (
-                            event["event_type"] == "DELAY_END"
-                            and event.get("play_wave_type")
-                            == PlayWaveType.EMPTY_CASE.name
-                        )
-                        and event["signal"] == cur_signal_id
-                        and states.get(event["section_name"], None) == state
-                    ],
-                )
+            for state in itertools.chain(set(states.values()), (None,))
+            for index, cur_signal_id in enumerate(signal_ids)
+            for start, end in play_event_pairs
+            if start["signal"] == cur_signal_id
+            and states.get(start["section_name"], None) == state
+        )
+    )
+    interval_zip.extend(
+        (
+            (
+                _IntervalStartEvent(
+                    event_type="DELAY_START",
+                    signal_id=cur_signal_id,
+                    time=start["time"] + delay,
+                    play_wave_id=None,
+                    amplitude=None,
+                    index=index,
+                    oscillator_phase=None,
+                    oscillator_frequency=None,
+                    phase=None,
+                    sub_channel=sub_channel,
+                    baseband_phase=None,
+                    play_pulse_parameters=None,
+                    pulse_pulse_parameters=None,
+                    state=states.get(start["section_name"], None),
+                    markers=None,
+                    amp_param=None,
+                ),
+                _IntervalEndEvent(
+                    event_type="DELAY_END",
+                    time=end["time"] + delay,
+                    play_wave_id=None,
+                    index=index,
+                ),
             )
+            for state in itertools.chain(set(states.values()), (None,))
+            for index, cur_signal_id in enumerate(signal_ids)
+            for start, end in delay_event_pairs
+            if start.get("play_wave_type") == PlayWaveType.EMPTY_CASE.name
+            and start["signal"] == cur_signal_id
+            and states.get(start["section_name"], None) == state
+        )
+    )
 
     if len(interval_zip) > 0:
         _logger.debug(
@@ -280,6 +290,7 @@ def _make_interval_tree(
                     state=interval_start.state,
                     start_rounding_error=start_rounding_error,
                     markers=interval_start.markers,
+                    amp_param=interval_start.amp_param,
                 ),
             )
 
@@ -407,7 +418,12 @@ def _oscillator_intervals(
     return retval
 
 
-def _make_pulse_signature(pulse_iv: Interval, wave_iv: Interval, signal_ids: List[str]):
+def _make_pulse_signature(
+    pulse_iv: Interval,
+    wave_iv: Interval,
+    signal_ids: list[str],
+    amplitude_registers: dict[str, int],
+):
     data: _PlayIntervalData = pulse_iv.data
     _logger.debug("Looking at child %s", pulse_iv)
     start = pulse_iv.begin - wave_iv.begin
@@ -430,7 +446,11 @@ def _make_pulse_signature(pulse_iv: Interval, wave_iv: Interval, signal_ids: Lis
     combined_pulse_parameters = combine_pulse_parameters(
         data.pulse_pulse_parameters, None, data.play_pulse_parameters
     )
+
+    amplitude_register = amplitude_registers.get(data.amp_param, 0)
+
     markers = data.markers
+
     signature = PulseSignature(
         start=start,
         pulse=data.pulse,
@@ -446,6 +466,7 @@ def _make_pulse_signature(pulse_iv: Interval, wave_iv: Interval, signal_ids: Lis
         if combined_pulse_parameters is None
         else frozenset(combined_pulse_parameters.items()),
         markers=None if not markers else tuple(frozenset(m.items()) for m in markers),
+        preferred_amplitude_register=amplitude_register,
     )
     pulse_parameters = (
         frozenset((data.play_pulse_parameters or {}).items()),
@@ -455,8 +476,8 @@ def _make_pulse_signature(pulse_iv: Interval, wave_iv: Interval, signal_ids: Lis
 
 
 def _interval_start_after_oscillator_reset(
-    events, signals, compacted_intervals: IntervalTree, delay, sampling_rate
-):
+    events, signals, compacted_intervals: list[Interval], delay, sampling_rate
+) -> set[int]:
     device_id = next(iter(signals.values())).awg.device_id
 
     osc_reset_event_time = [
@@ -489,8 +510,10 @@ def analyze_play_wave_times(
     other_events: AWGSampledEventSequence,
     waveform_size_hints: Tuple[int, int],
     phase_resolution_range: int,
+    amplitude_resolution_range: int,
     sub_channel: Optional[int] = None,
     use_command_table: bool = False,
+    use_amplitude_increment: bool = False,
 ) -> AWGSampledEventSequence:
     signal_ids = list(signals.keys())
     sample_multiple = device_type.sample_multiple
@@ -517,8 +540,6 @@ def analyze_play_wave_times(
     interval_tree = _make_interval_tree(
         events, states, signal_ids, delay, sub_channel, sampling_rate
     )
-
-    use_ct_phase = use_command_table and all(s.hw_oscillator for s in signals.values())
 
     sequence_end = _sequence_end(
         events, sampling_rate, sample_multiple, delay, waveform_size_hints
@@ -582,8 +603,6 @@ def analyze_play_wave_times(
 
     interval_events = AWGSampledEventSequence()
 
-    signatures = set()
-
     # Add branching points as events
     for section_name, ivs in branching_intervals.items():
         for interval in ivs:
@@ -607,29 +626,27 @@ def analyze_play_wave_times(
         events, signals, compacted_intervals, delay, sampling_rate
     )
 
-    # When the sequencer starts, the phase of all sine generators is initialized to 0
-    # (On HDAWG, we additionally use `setSinePhase()` to set the phase of the I channel to 90°)
-    hw_oscillator_phases = {
-        signal.hw_oscillator: 0.0
-        for signal in signals.values()
-        if signal.hw_oscillator is not None
-    }
+    amplitude_register_count = (
+        device_type.amplitude_register_count if use_command_table else 1
+    )
+    (
+        amplitude_register_set_events,
+        amplitude_register_by_param,
+    ) = analyze_amplitude_register_set_events(
+        events, device_type, sampling_rate, delay, use_command_table
+    )
 
     k: Interval
-    for k in sorted(compacted_intervals.items()):
+    for k in compacted_intervals:
         _logger.debug("Calculating signature for %s and its children", k)
-
-        if k.begin in interval_start_after_oscillator_reset:
-            hw_oscillator_phases = {}
 
         overlap: Set[Interval] = interval_tree.overlap(k.begin, k.end)
         _logger.debug("Overlap is %s", overlap)
 
         v = sorted(overlap)
 
-        hw_oscillator_intervals: Set[Interval] = oscillator_intervals.overlap(k)
-        assert len(hw_oscillator_intervals) == 1
-        hw_oscillator = next(iter(hw_oscillator_intervals)).data["oscillator"]
+        [hw_oscillator_interval] = oscillator_intervals.overlap(k)
+        hw_oscillator = hw_oscillator_interval.data["oscillator"]
 
         # Group by states for match/state sections
         v_state: Dict[int, List[Interval]] = {}
@@ -643,17 +660,12 @@ def analyze_play_wave_times(
             has_child = False
             for iv in sorted(intervals, key=lambda x: (x.begin, x.data.channel)):
                 pulse_signature, these_pulse_parameters = _make_pulse_signature(
-                    iv, k, signal_ids
+                    iv, k, signal_ids, amplitude_register_by_param
                 )
                 signature_pulses.append(pulse_signature)
                 pulse_parameters.append(these_pulse_parameters)
                 has_child = True
             waveform_signature = WaveformSignature(k.length(), tuple(signature_pulses))
-
-            if hw_oscillator is not None:
-                current_hw_oscillator_phase = hw_oscillator_phases.get(hw_oscillator)
-            else:
-                current_hw_oscillator_phase = None
 
             if use_command_table and device_type == DeviceType.SHFSG:
                 ct_hw_oscillator = hw_oscillator
@@ -664,31 +676,15 @@ def analyze_play_wave_times(
                 pulse.pulse == "dummy_precomp_reset" for pulse in signature_pulses
             )
 
-            signature = reduce_signature_phase(
-                PlaybackSignature(
-                    waveform=waveform_signature,
-                    hw_oscillator=ct_hw_oscillator,
-                    pulse_parameters=tuple(pulse_parameters),
-                    state=state,
-                    clear_precompensation=precomp_reset,
-                ),
-                use_ct_phase,
-                current_hw_oscillator_phase,
+            signature = PlaybackSignature(
+                waveform=waveform_signature,
+                hw_oscillator=ct_hw_oscillator,
+                pulse_parameters=tuple(pulse_parameters),
+                state=state,
+                clear_precompensation=precomp_reset,
             )
-            if use_command_table:
-                signature = reduce_signature_amplitude(signature)
-
-            if hw_oscillator is not None:
-                if signature.set_phase is not None:
-                    hw_oscillator_phases[hw_oscillator] = signature.set_phase
-                elif signature.increment_phase is not None:
-                    hw_oscillator_phases[hw_oscillator] += signature.increment_phase
-
-            if phase_resolution_range >= 1:
-                signature.quantize_phase(phase_resolution_range)
 
             if has_child:
-                signatures.add(signature)
                 start = k.begin
                 interval_event = AWGEvent(
                     type=AWGEventType.PLAY_WAVE,
@@ -700,6 +696,116 @@ def analyze_play_wave_times(
                     },
                 )
                 interval_events.add(start, interval_event)
+
+    # When the sequencer starts, the phase of all sine generators is initialized to 0
+    # (On HDAWG, we additionally use `setSinePhase()` to set the phase of the I channel
+    # to 90°)
+    if device_type == DeviceType.SHFSG:
+        hw_oscillator_phases = {
+            signal.hw_oscillator: 0.0
+            for signal in signals.values()
+            if signal.hw_oscillator is not None
+        }
+    else:
+        # On instruments that do not support oscillator multiplexing, the oscillator
+        # is not specified in the command table. We use `None` as a dummy value to
+        # represent the single oscillator available. This way the logic need not be
+        # duplicated.
+        hw_oscillator_phases = {None: 0.0}
+
+    # A value of 'None' indicates that we do not know the current value (e.g. after a
+    # match block, where we may conditionally have written to the register).
+    amplitude_register_values: list[float | None] = [None] * amplitude_register_count
+
+    use_ct_phase = use_command_table and all(s.hw_oscillator for s in signals.values())
+    signatures = set()
+
+    interval_events.merge(amplitude_register_set_events)
+
+    priorities = {
+        AWGEventType.INIT_AMPLITUDE_REGISTER: 0,
+        AWGEventType.PLAY_WAVE: 1,
+        AWGEventType.MATCH: 1,
+    }
+
+    for _, event_list in interval_events.sequence.items():
+        for event in sorted(event_list, key=lambda x: priorities[x.type]):
+            if event.type == AWGEventType.PLAY_WAVE:
+                signature = event.params["playback_signature"]
+                signature = reduce_signature_amplitude_register(signature)
+                signature = reduce_signature_amplitude(
+                    signature,
+                    use_command_table,
+                    amplitude_register_values if use_amplitude_increment else None,
+                )
+
+                hw_oscillator = signature.hw_oscillator
+                current_hw_oscillator_phase = hw_oscillator_phases.get(hw_oscillator)
+
+                if event.start in interval_start_after_oscillator_reset:
+                    # after a reset we force an absolute phase
+                    current_hw_oscillator_phase = None
+
+                signature = reduce_signature_phase(
+                    signature, use_ct_phase, current_hw_oscillator_phase
+                )
+
+                # Note how we store phase increments _before_ quantizing and absolute
+                # phase _after_. In principle, for avoiding accumulation of rounding
+                # errors, we would store the quantized values in both cases. This way,
+                # the compiler can track the actual value with full precision. We do so
+                # for the amplitude, see below.
+                # However, we want phase increments to be independent, and specifically
+                # want to avoid the compiler magically dithering the phase based on the
+                # past. Unlike for amplitude, a virtual z gate sets a new reference.
+                # We do not attempt do work around errors in that new reference.
+                # See also HBAR-1656. This will need rework when implementing conditional
+                # virtual z gates.
+                if signature.increment_phase is not None:
+                    hw_oscillator_phases[hw_oscillator] += signature.increment_phase
+                if phase_resolution_range >= 1:
+                    signature.quantize_phase(phase_resolution_range)
+                if signature.set_phase is not None:
+                    hw_oscillator_phases[hw_oscillator] = signature.set_phase
+
+                if amplitude_resolution_range >= 1:
+                    signature.quantize_amplitude(amplitude_resolution_range)
+                if signature.set_amplitude is not None:
+                    amplitude_register_values[
+                        signature.amplitude_register
+                    ] = signature.set_amplitude
+                if signature.increment_amplitude is not None:
+                    amplitude_register_values[
+                        signature.amplitude_register
+                    ] += signature.increment_amplitude
+
+                if signature.state is not None:
+                    # After a conditional playback, we do not know for sure what value
+                    # was written to the amplitude register. Mark it as such, to avoid
+                    # emitting an increment for the next signature.
+                    # Todo: There are ways to improve on this:
+                    #   - Do not write the amplitude register in branches
+                    #   - Only clear those registers that were indeed written in a branch
+                    #   - ...
+                    amplitude_register_values = [None] * amplitude_register_count
+
+                if signature not in signatures:
+                    signatures.add(signature)
+            elif event.type == AWGEventType.INIT_AMPLITUDE_REGISTER:
+                signature = event.params["playback_signature"]
+                signature = reduce_signature_amplitude(
+                    signature, use_command_table, amplitude_register_values
+                )
+                if amplitude_resolution_range >= 1:
+                    signature.quantize_amplitude(amplitude_resolution_range)
+                if signature.set_amplitude is not None:
+                    amplitude_register_values[
+                        signature.amplitude_register
+                    ] = signature.set_amplitude
+                if signature.increment_amplitude is not None:
+                    amplitude_register_values[
+                        signature.amplitude_register
+                    ] += signature.increment_amplitude
 
     if len(signatures) > 0:
         _logger.debug(

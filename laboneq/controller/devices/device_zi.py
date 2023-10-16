@@ -7,12 +7,10 @@ import json
 import logging
 import math
 import re
-import time
 from abc import ABC
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from math import floor
 from typing import Any, Iterator
 from weakref import ReferenceType, ref
 
@@ -152,7 +150,7 @@ def delay_to_rounded_samples(
 class DeviceZI(ABC):
     def __init__(self, device_qualifier: DeviceQualifier, daq: DaqWrapper):
         self._device_qualifier: DeviceQualifier = device_qualifier
-        self._downlinks: dict[str, tuple[str, ReferenceType[DeviceZI]]] = {}
+        self._downlinks: dict[str, list[tuple[str, ReferenceType[DeviceZI]]]] = {}
         self._uplinks: list[ReferenceType[DeviceZI]] = []
         self._rf_offsets: dict[int, float] = {}
 
@@ -276,7 +274,9 @@ class DeviceZI(ABC):
         )
 
     def add_downlink(self, port: str, linked_device_uid: str, linked_device: DeviceZI):
-        self._downlinks[port] = (linked_device_uid, ref(linked_device))
+        self._downlinks.setdefault(port, []).append(
+            (linked_device_uid, ref(linked_device))
+        )
 
     def add_uplink(self, linked_device: DeviceZI):
         dev_ref = ref(linked_device)
@@ -286,6 +286,11 @@ class DeviceZI(ABC):
     def remove_all_links(self):
         self._downlinks.clear()
         self._uplinks.clear()
+
+    def downlinks(self) -> Iterator[tuple[str, str, DeviceZI]]:
+        for port, downstream_devices in self._downlinks.items():
+            for uid, dev_ref in downstream_devices:
+                yield port, uid, dev_ref()
 
     def is_leader(self):
         # Check also downlinks, to exclude standalone devices
@@ -337,12 +342,14 @@ class DeviceZI(ABC):
     ) -> list[DaqNodeAction]:
         return []
 
-    def collect_trigger_configuration_nodes(
+    # TODO(2K): Routine collecting nodes does not need to be asynchronous
+    # (caused by PQSC doing batch_set inside).
+    async def collect_trigger_configuration_nodes(
         self, initialization: Initialization, recipe_data: RecipeData
     ) -> list[DaqNodeAction]:
         return []
 
-    def _connect_to_data_server(self):
+    async def _connect_to_data_server(self):
         if self._connected:
             return
 
@@ -358,7 +365,7 @@ class DeviceZI(ABC):
 
         dev_type_path = f"/{self.serial}/features/devtype"
         dev_opts_path = f"/{self.serial}/features/options"
-        dev_traits = self._daq.batch_get(
+        dev_traits = await self._daq.batch_get(
             [
                 DaqNodeGetAction(self._daq, dev_type_path),
                 DaqNodeGetAction(self._daq, dev_opts_path),
@@ -374,8 +381,8 @@ class DeviceZI(ABC):
 
         self._connected = True
 
-    def connect(self):
-        self._connect_to_data_server()
+    async def connect(self):
+        await self._connect_to_data_server()
         self._daq.node_monitor.add_nodes(self.nodes_to_monitor())
 
     def disconnect(self):
@@ -419,6 +426,7 @@ class DeviceZI(ABC):
         nodes.extend([node.path for node in self.clock_source_control_nodes()])
         nodes.extend([node.path for node in self.system_freq_control_nodes()])
         nodes.extend([node.path for node in self.rf_offset_control_nodes()])
+        nodes.extend([node.path for node in self.zsync_link_control_nodes()])
         return nodes
 
     def update_clock_source(self, force_internal: bool | None):
@@ -437,6 +445,9 @@ class DeviceZI(ABC):
         return []
 
     def rf_offset_control_nodes(self) -> list[NodeControlBase]:
+        return []
+
+    def zsync_link_control_nodes(self) -> list[NodeControlBase]:
         return []
 
     def nodes_to_monitor(self) -> list[str]:
@@ -530,62 +541,10 @@ class DeviceZI(ABC):
     ) -> list[DaqNodeAction]:
         return []
 
-    def check_results_acquired_status(
+    async def check_results_acquired_status(
         self, channel, acquisition_type: AcquisitionType, result_length, hw_averages
     ):
         pass
-
-    def _wait_for_node(
-        self, path: str, expected: Any, timeout: float, guard_time: float = 0
-    ):
-        retries = 0
-        start_time = time.time()
-        guard_start = None
-        last_report = start_time
-        last_val = None
-
-        while True:
-            if retries > 0:
-                now = time.time()
-                elapsed = floor(now - start_time)
-                if now - start_time > timeout:
-                    raise LabOneQControllerException(
-                        f"{self.dev_repr}: Node '{path}' didn't switch to '{expected}' "
-                        f"within {timeout}s. Last value: {last_val}"
-                    )
-                if now - last_report > 5:
-                    _logger.debug(
-                        "Waiting for node '%s' switching to '%s', %f s remaining "
-                        "until %f s timeout...",
-                        path,
-                        expected,
-                        timeout - elapsed,
-                        timeout,
-                    )
-                    last_report = now
-                time.sleep(0.1)
-            retries += 1
-
-            daq_reply = self._daq.batch_get(
-                [
-                    DaqNodeGetAction(
-                        self._daq, path, caching_strategy=CachingStrategy.NO_CACHE
-                    )
-                ]
-            )
-            last_val = daq_reply[path.lower()]
-
-            if self.dry_run:
-                break
-
-            if last_val != expected:
-                guard_start = None  # Start over the guard time waiting
-                continue
-
-            if guard_start is None:
-                guard_start = time.time()
-            if time.time() - guard_start >= guard_time:
-                break
 
     def _adjust_frequency(self, freq):
         return freq
@@ -861,31 +820,6 @@ class DeviceZI(ABC):
             json.dumps(command_table, sort_keys=True),
             caching_strategy=CachingStrategy.NO_CACHE,
         )
-
-    def upload_command_table(self, awg_index, command_table: dict):
-        command_table_path = self.command_table_path(awg_index)
-        self._daq.batch_set(
-            [self.prepare_upload_command_table(awg_index, command_table)]
-        )
-
-        status_path = command_table_path + "status"
-
-        status = int(
-            self._daq.batch_get(
-                [
-                    DaqNodeGetAction(
-                        self._daq,
-                        status_path,
-                    )
-                ]
-            )[status_path]
-        )
-
-        if status & 0b1000 != 0:
-            raise LabOneQControllerException("Failed to parse command table JSON")
-        if not self.dry_run:
-            if status & 0b0001 == 0:
-                raise LabOneQControllerException("Failed to upload command table")
 
     def compile_seqc(self, code: str, awg_index: int, filename_hint: str = None):
         _logger.debug(
